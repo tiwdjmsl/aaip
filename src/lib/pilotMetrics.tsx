@@ -42,12 +42,13 @@ export function computeMetrics(log: MetricEvent[], tickets: T[], decisions: Reco
   }
   const decided = tickets.filter(t => decisions[t.raw.ticketId] && decisions[t.raw.ticketId].status !== 'Pending Review');
   const confirmed = decided.filter(t => decisions[t.raw.ticketId].kind === 'Confirmed').length;
+  const overridden = decided.filter(t => decisions[t.raw.ticketId].kind === 'Overridden').length;
   const groupBy = (key: (t: T) => string) => {
     const keys = Array.from(new Set(tickets.map(key)));
-    return keys.map(k => { const d = decided.filter(t => key(t) === k); const c = d.filter(t => decisions[t.raw.ticketId].kind === 'Confirmed').length; return { key: k, total: tickets.filter(t => key(t) === k).length, decided: d.length, confirmed: c, overridden: d.length - c }; });
+    return keys.map(k => { const d = decided.filter(t => key(t) === k); const c = d.filter(t => decisions[t.raw.ticketId].kind === 'Confirmed').length; const o = d.filter(t => decisions[t.raw.ticketId].kind === 'Overridden').length; return { key: k, total: tickets.filter(t => key(t) === k).length, decided: d.length, confirmed: c, overridden: o }; });
   };
   return {
-    total: tickets.length, decided: decided.length, confirmed, overridden: decided.length - confirmed,
+    total: tickets.length, decided: decided.length, confirmed, overridden, escalated: decided.length - confirmed - overridden,
     avgReviewMs: mean(reviewMs), reviewSamples: reviewMs.length,
     avgToQcMs: mean(toQc), avgQcToGovMs: mean(qcToGov), avgGovToMgmtMs: mean(govToMgmt),
     qcAgreed, qcReturned, govApproved, govEscalated,
@@ -81,7 +82,7 @@ export function PilotMetrics({ log, tickets, decisions }: { log: MetricEvent[]; 
       <p>Measured from the reviews done in this session. Agreement rate shows how often the human auditor accepted the AI finding; it is not accuracy, which would need NTT’s own audited results as the answer key.</p></div></div>
     <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>
       {card('Tickets reviewed', `${m.decided} / ${m.total}`)}
-      {card('AI–auditor agreement', pct(m.confirmed, m.decided), `${m.confirmed} confirmed · ${m.overridden} overridden`)}
+      {card('AI–auditor agreement', pct(m.confirmed, m.decided), `${m.confirmed} confirmed · ${m.overridden} overridden · ${m.escalated} escalated`)}
       {card('QC return rate', pct(m.qcReturned, m.qcAgreed + m.qcReturned), `${m.qcReturned} returned of ${m.qcAgreed + m.qcReturned} QC checks`)}
       {card('Avg review time', fmtDuration(m.avgReviewMs), m.reviewSamples ? `from ${m.reviewSamples} ticket(s): open → decision` : 'No timed reviews yet')}
     </div>
