@@ -2,7 +2,10 @@ export type RiskLevel = 'Low' | 'Medium' | 'High' | 'Critical';
 export type AuditStatus = 'Pending Review' | 'Reviewed' | 'Escalated';
 export type AuditDecisionKind = 'Confirmed' | 'Overridden';
 
-/** Source-system attributes only; audit outcomes are intentionally separate. */
+/** Source-system attributes only; audit outcomes are intentionally separate.
+ * The four fields at the end are OPTIONAL -- most datasets (like the synthetic
+ * demo set) won't have them, and the audit engine simply skips the related
+ * checks when they're absent. Only richer exports (e.g. BPIC2014) populate these. */
 export type RawTicket = {
   ticketId: string;
   ticketType: string;
@@ -15,15 +18,26 @@ export type RawTicket = {
   approvalStatus: string;
   resolutionNotes: string;
   resolutionQuality: string;
-  /** Optional behavioural features — present when the CSV includes event-log-derived columns.
-   *  When absent, the Isolation Forest runs on the four structured ticket fields only. */
+  impact?: number;
+  urgency?: number;
   reassignmentCount?: number;
+  reopenTime?: string;
   reopenCount?: number;
   activityCount?: number;
   groupDiversity?: number;
+  escalationEvidence?: string;
+  rootCauseEvidence?: string;
+  preImplementationEvidence?: string;
+  postImplementationEvidence?: string;
+  fulfilmentEvidence?: string;
+  synthetic?: boolean;
+  evidenceRecords?: {
+    id: string; ticketId: string; ruleId: string; sourceLabel: string; content: string;
+    state: 'VALIDATED_SUPPORTS' | 'VALIDATED_CONTRADICTS' | 'SUPPLIED_UNVALIDATED';
+    reviewedBy?: string; reviewedAt?: string; synthetic?: boolean;
+  }[];
 };
 
-/** Calculated from RawTicket by the audit engine. */
 export type AuditAssessment = {
   ticketId: string;
   complianceScore: number;
@@ -36,7 +50,6 @@ export type AuditAssessment = {
   generatedAt: string;
 };
 
-/** The auditor's decision is not part of the assessment. */
 export type AuditDecision = {
   ticketId: string;
   status: AuditStatus;
@@ -44,6 +57,12 @@ export type AuditDecision = {
   decisionDate?: string;
   rationale?: string;
   overrideReason?: string;
+  humanFinding?: 'Compliant' | 'Non-compliant';
+  finalFinding?: string;
+  evidenceRef?: string;
+  evidenceReviewed?: boolean;
+  version?: number;
+  ruleVersion?: number;
 };
 
 export type AuditTrailEntry = {

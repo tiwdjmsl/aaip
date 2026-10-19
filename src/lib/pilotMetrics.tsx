@@ -1,4 +1,3 @@
-import { useState } from 'react';
 
 /* Pilot metrics: measured from real clicks in this browser session.
  * Agreement rate is NOT accuracy (no ground truth); timing starts when metrics are first captured. */
@@ -64,10 +63,6 @@ const card = (label: string, value: string, note?: string) => (
 
 export function PilotMetrics({ log, tickets, decisions }: { log: MetricEvent[]; tickets: T[]; decisions: Record<string, D> }) {
   const m = computeMetrics(log, tickets, decisions);
-  const [baseline, setBaseline] = useState<string>(() => { try { return localStorage.getItem('aaip-baseline-min') ?? ''; } catch { return ''; } });
-  const setBase = (v: string) => { setBaseline(v); try { localStorage.setItem('aaip-baseline-min', v); } catch { /* ignore */ } };
-  const base = Number(baseline);
-  const saved = base > 0 && m.avgReviewMs !== null ? Math.max(0, base * 60_000 - m.avgReviewMs) * m.decided : null;
   const table = (title: string, rows: ReturnType<typeof computeMetrics>['byType']) => (
     <section className="panel" style={{ flex: '1 1 320px' }}>
       <h2>{title}</h2>
@@ -96,12 +91,5 @@ export function PilotMetrics({ log, tickets, decisions }: { log: MetricEvent[]; 
       </div>
     </section>
     <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 12 }}>{table('By ticket type', m.byType)}{table('By AI risk level', m.byRisk)}</div>
-    <section className="panel">
-      <h2>Time saved vs manual (optional)</h2>
-      <label>Manual audit time per ticket today, in minutes (enter NTT’s own figure)<br />
-        <input type="number" min="0" value={baseline} onChange={e => setBase(e.target.value)} style={{ marginTop: 6 }} /></label>
-      <p style={{ marginTop: 8 }}>{saved === null ? 'Enter a baseline and complete at least one timed review to see an estimate.' : `Estimated time saved on ${m.decided} reviewed ticket(s): ${fmtDuration(saved)} (baseline ${base} min − measured ${fmtDuration(m.avgReviewMs)} per ticket).`}</p>
-      <small>The baseline is a number you supply, not a measurement. Measured times reflect this demo only; real pilot figures need real auditors on real tickets.</small>
-    </section>
   </>;
 }
