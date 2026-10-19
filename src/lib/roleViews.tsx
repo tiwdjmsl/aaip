@@ -1,7 +1,9 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import type { AuditAssessment, AuditDecision, AuditTrailEntry, RawTicket } from '../types/audit';
 import { stageOf, type Persona, type Role, type StepOutcome, type Workflow } from './roles';
-import { computeMetrics, fmtDuration, type MetricEvent } from './pilotMetrics';
+import { checklistFor, evidenceSources, classifySla, classifyApproval } from './assuranceControls';
+import type { GovernanceRules } from './auditEngine';
+import { type MetricEvent } from './pilotMetrics';
 
 /* Role views modelled on "AAIP Role-Based Views". Prototype: client-side only. */
 
@@ -12,25 +14,22 @@ export type BlindView = 'Compliant' | 'Non-compliant' | 'Escalate';
 
 /* ------------------------------ derived signals ------------------------------ */
 export function checklistOf(t: TV) {
-  const missingApproval = /missing/i.test(t.raw.approvalStatus);
-  const slaBreach = /breach/i.test(t.raw.slaStatus);
-  const docGap = t.assessment.findings.some(f => /documentation/i.test(f));
-  const items = [
-    { tier: 'A', label: 'Approval evidence on file', result: missingApproval ? 'FAIL' : 'PASS', area: 'approval' },
-    { tier: 'A', label: 'SLA compliance', result: slaBreach ? 'FAIL' : 'PASS', area: 'SLA' },
-    { tier: 'B', label: 'Documentation completeness', result: docGap ? 'FAIL' : 'PASS', area: 'docs' },
-    { tier: 'C', label: 'Investigation / resolution quality', result: 'JUDGEMENT', area: 'quality' },
-  ];
+  const c = checklistFor(t.raw);
+  /* escalation / scope controls count as "documentation" for the roll-up views */
+  const items = c.items.map(i => ({ ...i, area: i.area === 'escalation' || i.area === 'scope' ? 'docs' : i.area }));
   const fails = items.filter(i => i.result === 'FAIL');
-  const scored = items.filter(i => i.result !== 'JUDGEMENT');
-  return { items, fails, pass: fails.length === 0, label: fails.length ? `FAIL · ${fails.map(f => f.area).join(', ')}` : 'PASS', sampled: `${scored.length - fails.length} of ${scored.length} sampled items passed` };
+  const notAssessed = items.filter(i => i.result === 'NOT_ASSESSED');
+  const automated = items.filter(i => i.result !== 'JUDGEMENT' && i.result !== 'NOT_APPLICABLE');
+  const validated = automated.filter(i => i.evidenceStatus === 'VALIDATED_SUPPORTS' || i.evidenceStatus === 'VALIDATED_CONTRADICTS').length;
+  return { ...c, items, fails, notAssessed, pass: !fails.length && !notAssessed.length, coverage: automated.length ? Math.round(100 * validated / automated.length) : 0 };
 }
+export const failsIn = (t: TV, area: string) => checklistOf(t).items.some(i => i.area === area && i.result === 'FAIL');
 export function behaviourOf(t: TV) {
   const finding = t.assessment.findings.find(f => /anomal/i.test(f));
   return { flagged: Boolean(finding) || t.assessment.anomalyDetected, finding };
 }
 const isHighRisk = (t: TV) => t.assessment.riskLevel === 'High' || t.assessment.riskLevel === 'Critical';
-const aiStance = (t: TV): BlindView => (checklistOf(t).pass ? 'Compliant' : 'Non-compliant');
+const aiStance = (t: TV): BlindView => (checklistOf(t).fails.length ? 'Non-compliant' : 'Compliant');
 /** What the auditor's final decision means in compliant / non-compliant terms. */
 export function auditorStance(t: TV, d: AuditDecision | undefined): BlindView | null {
   if (!d || d.status === 'Pending Review') return null;
@@ -116,6 +115,10 @@ export function SubNav({ pages, page, go }: { pages: string[]; page: string; go:
 export const Stat = ({ label, value, note, color }: { label: string; value: ReactNode; note?: string; color?: string }) =>
   <div className="rv-card rv-stat" style={{ marginBottom: 0 }}><small>{label}</small><b style={{ color }}>{value}</b>{note ? <span>{note}</span> : null}</div>;
 const Pill = ({ tone, children }: { tone: string; children: ReactNode }) => <span className={`rv-pill ${tone}`}>{children}</span>;
+const ResultPill = ({ i }: { i: { result: string; evidenceStatus: string } }) =>
+  i.result === 'JUDGEMENT' ? <Pill tone="grey">Human judgement pending</Pill>
+  : i.result === 'NOT_ASSESSED' ? <Pill tone="amber">{i.evidenceStatus === 'NOT_SUPPLIED' ? 'Not supplied' : 'Supplied · not validated'}</Pill>
+  : <Pill tone={i.result === 'PASS' ? 'green' : i.result === 'NOT_APPLICABLE' ? 'grey' : 'red'}>{i.result.replace('_', ' ')}</Pill>;
 const statusPill = (t: TV, d: AuditDecision | undefined) => {
   if (!d || d.status === 'Pending Review') return isHighRisk(t) ? <Pill tone="red">High risk</Pill> : <Pill tone="amber">Pending</Pill>;
   if (d.kind === 'Confirmed') return <Pill tone="green">Reviewed</Pill>;
@@ -142,7 +145,7 @@ export function AuditorQueue({ tickets, decisions, initialFilter, open, go }: { 
       <table className="rv-tbl"><thead><tr><th>TICKET</th><th>TYPE</th><th>CHECKLIST</th><th>BEHAVIOUR</th><th>STATUS</th><th /></tr></thead>
         <tbody>{rows.length ? rows.map(t => { const c = checklistOf(t); const b = behaviourOf(t); const d = decisions[t.raw.ticketId];
           return <tr key={t.raw.ticketId}><td><span className="rv-id">{t.raw.ticketId}</span></td><td>{t.raw.ticketType} · {t.raw.title}</td>
-            <td><Pill tone={c.pass ? 'green' : 'red'}>{c.label}</Pill></td><td>{b.flagged ? <Pill tone="ind">Flagged</Pill> : '—'}</td><td>{statusPill(t, d)}</td>
+            <td><Pill tone={c.fails.length ? 'red' : c.notAssessed.length ? 'amber' : 'green'}>{c.label}</Pill></td><td>{b.flagged ? <Pill tone="ind">Flagged</Pill> : '—'}</td><td>{statusPill(t, d)}</td>
             <td><button className="rv-link" onClick={() => open(t, pending(t) ? 'decision' : 'read')}>Open →</button></td></tr>; }) : <tr><td colSpan={6}>No tickets match this filter.</td></tr>}</tbody></table>
     </div>
     <div className="rv-foot">Checklist and Behaviour are separate signals by design — a ticket can pass every rule and still be flagged for the auditor’s judgement.</div>
@@ -151,16 +154,34 @@ export function AuditorQueue({ tickets, decisions, initialFilter, open, go }: { 
 
 /* ------------------------------ Ticket detail ------------------------------ */
 export type Explainers = { evidence: (t: TV, f: string) => string; criterion: (f: string) => string; recommendation: (f: string, r: string[]) => string };
-export function TicketDetailV2({ ticket, from, go, record, trail, canDecide, save, today, explain, overrideReasons }: {
-  ticket: TV; from: string; go: (p: string) => void; record: AuditDecision; trail: AuditTrailEntry[]; canDecide: boolean;
+export function TicketDetailV2({ ticket, from, go, record, trail, workflowRecord, rules, canDecide, save, today, explain, overrideReasons }: {
+  ticket: TV; from: string; go: (p: string) => void; record: AuditDecision; trail: AuditTrailEntry[]; workflowRecord?: Workflow[string]; rules?: GovernanceRules; canDecide: boolean;
   save: (d: AuditDecision) => void; today: () => string; explain: Explainers; overrideReasons: string[];
 }) {
   const c = checklistOf(ticket); const b = behaviourOf(ticket); const done = record.status !== 'Pending Review';
   const [rationale, setRationale] = useState(''); const [mode, setMode] = useState<'' | 'override'>('');
   const [reason, setReason] = useState('');
-  const base = { ticketId: ticket.raw.ticketId, decisionDate: today() };
-  const behFindings = ticket.assessment.findings.filter(f => /anomal/i.test(f));
-  const otherFindings = ticket.assessment.findings.filter(f => !/anomal/i.test(f));
+  const [humanFinding, setHumanFinding] = useState<'' | 'Compliant' | 'Non-compliant'>('');
+  const [overrideFinding, setOverrideFinding] = useState<'' | 'Compliant' | 'Non-compliant'>('');
+  const [evidenceRef, setEvidenceRef] = useState(''); const [evidenceReviewed, setEvidenceReviewed] = useState(false);
+  const sources = evidenceSources(ticket.raw);
+  const hasRationale = Boolean(rationale.trim());
+  const canConfirm = Boolean(humanFinding) && hasRationale && (!c.notAssessed.length || c.fails.length > 0) && (c.fails.length > 0 || humanFinding === 'Compliant');
+  const canOverride = Boolean(humanFinding && overrideFinding && reason && hasRationale && evidenceRef && evidenceReviewed);
+  const confirmResult: 'Compliant' | 'Non-compliant' = c.fails.length ? 'Non-compliant' : 'Compliant';
+  const base = { ticketId: ticket.raw.ticketId, decisionDate: today(), version: 1, ruleVersion: 1 };
+  const behFindings = ticket.assessment.findings.filter(f => /anomal|repeated handoffs/i.test(f));
+  const controlFindings = c.items.filter(i => i.result === 'FAIL' || i.result === 'NOT_ASSESSED').map(i => {
+    const key = i.weightKey as keyof GovernanceRules | undefined; const pen = key && rules ? rules[key] : undefined;
+    return {
+      key: i.id,
+      title: i.result === 'FAIL' ? `${i.label}: FAIL (recorded control exception${pen !== undefined ? `; provisional penalty ${pen}` : ''}).` : `${i.label}: ${i.evidenceStatus === 'NOT_SUPPLIED' ? 'evidence not supplied' : 'evidence supplied but not validated'}.`,
+      evidence: i.evidence.replace(/\n/g, ' · '), criterion: `${i.id} · Tier ${i.tier} · ${i.evidenceRequirement}`,
+      recommendation: `Review ${i.label.toLowerCase()} against the linked source; request missing or unvalidated evidence.`,
+    };
+  });
+  const signal = c.state === 'FAIL' ? { cls: 'bad', text: 'FAIL', colour: '#b91c1c' } : c.state === 'NOT_ASSESSED' ? { cls: 'none', text: 'INSUFFICIENT EVIDENCE', colour: '#0f766e' } : { cls: 'ok', text: 'CHECKS PASSED · TIER C PENDING', colour: '#0f766e' };
+  const history = workflowRecord?.history ?? [];
   return <div className="rv-page">
     <button className="rv-link" onClick={() => go(from)}>← Back to {from}</button>
     <div className="rv-head" style={{ margin: '10px 0 16px' }}><h1 style={{ fontSize: 22 }}>{ticket.raw.ticketId} · {ticket.raw.title}</h1>{statusPill(ticket, record)}</div>
@@ -169,38 +190,59 @@ export function TicketDetailV2({ ticket, from, go, record, trail, canDecide, sav
         <div className="rv-card"><h2>Source ticket</h2>
           <div className="rv-kv"><div><span>Type</span><b>{ticket.raw.ticketType}</b></div><div><span>Priority</span><b>{ticket.raw.priority}</b></div>
             <div><span>Created</span><b>{new Date(ticket.raw.createdDate).toLocaleDateString('en-GB')}</b></div><div><span>Resolved</span><b>{new Date(ticket.raw.resolutionDate).toLocaleDateString('en-GB')}</b></div>
-            <div><span>SLA</span><b style={{ color: /breach/i.test(ticket.raw.slaStatus) ? '#b91c1c' : '#047857' }}>{ticket.raw.slaStatus}</b></div><div><span>Approval</span><b style={{ color: /missing/i.test(ticket.raw.approvalStatus) ? '#b91c1c' : '#047857' }}>{ticket.raw.approvalStatus}</b></div></div>
+            <div><span>SLA</span><b style={{ color: classifySla(ticket.raw.slaStatus) === 'FAIL' ? '#b91c1c' : classifySla(ticket.raw.slaStatus) === 'PASS' ? '#047857' : '#64748b' }}>{ticket.raw.slaStatus}</b></div>
+            <div><span>Approval</span><b style={{ color: classifyApproval(ticket.raw.approvalStatus) === 'FAIL' ? '#b91c1c' : classifyApproval(ticket.raw.approvalStatus) === 'PASS' ? '#047857' : '#64748b' }}>{ticket.raw.approvalStatus}</b></div></div>
           <h3>Issue description</h3><p>{ticket.raw.description}</p><h3>Resolution notes</h3><p>“{ticket.raw.resolutionNotes}”</p></div>
-        <div className="rv-card"><h2>Decision authority</h2><p>AI Decision Authority: <b>Recommendation only</b> — human auditor approval required for every ticket.</p></div>
+        <div className="rv-card"><h2>Case lifecycle &amp; traceability</h2>
+          <p>Current stage: <b>{stageOf(record, workflowRecord)}</b> · Auditor decision version {record.version ?? 'pending'} · Applied rule version {record.ruleVersion ?? 'pending'}.</p>
+          {history.length ? <details><summary>QC / Governance / Management review history ({history.length})</summary>{history.map((entry, index) => <p key={index} style={{ fontSize: 12, marginTop: 7 }}>{entry}</p>)}</details> : <p>Independent QC and governance outcomes will appear here after they are recorded.</p>}
+          <p>No corrective action has been linked to this case.</p></div>
+        <div className="rv-card"><h2>Decision authority</h2><p>Automated assessment: <b>Recommendation only</b> — human auditor approval required for every ticket.</p></div>
       </div>
       <div>
         <div className="rv-sigs">
-          <div className={`rv-sig ${c.pass ? 'ok' : 'bad'}`}><small>Checklist result</small><b style={{ color: c.pass ? '#047857' : '#b91c1c' }}>{c.pass ? 'PASS' : 'FAIL'}</b><span style={{ fontSize: 12 }}>{c.pass ? c.sampled : `Failed: ${c.fails.map(f => f.area).join(', ')}`}</span></div>
-          <div className={`rv-sig ${b.flagged ? 'beh' : 'none'}`}><small>Behavioural signal</small><b style={{ color: b.flagged ? '#4338ca' : '#64748b', fontSize: 20 }}>{b.flagged ? 'Flagged for review' : 'Nothing unusual'}</b><span style={{ fontSize: 12 }}>{b.flagged ? 'Statistical outlier vs. similar tickets' : 'Within the range of similar tickets'}</span></div>
+          <div className={`rv-sig ${signal.cls}`}><small>Automated checklist status</small><b style={{ fontSize: 17, color: signal.colour }}>{signal.text}</b>
+            <span style={{ fontSize: 12 }}>{`${c.items.filter(i => i.result === 'PASS').length} automated PASS · ${c.fails.length} FAIL · ${c.gaps.length} evidence gaps`}. Final determination requires human review.</span></div>
+          <div className={`rv-sig ${b.flagged ? 'beh' : 'none'}`}><small>Behavioural analysis</small><b style={{ color: b.flagged ? '#4338ca' : '#64748b', fontSize: 20 }}>{b.flagged ? 'Flagged for review' : 'No review cue triggered'}</b>
+            <span style={{ fontSize: 12 }}>{b.flagged ? 'Behavioural review cue; examine the original activity history' : 'Available evidence did not trigger a cue'}</span></div>
         </div>
-        <div className="rv-card"><h2>Checklist items</h2><p style={{ fontSize: 12 }}>Representative subset for this prototype — the full checklist and Tier A/B/C mapping are pending confirmation with the audit team.</p>
-          {c.items.map(i => <div className="rv-chk" key={i.label}><span className="tier">Tier {i.tier}</span><span className="lbl">{i.label}</span>
-            {i.result === 'JUDGEMENT' ? <Pill tone="grey">Human judgement</Pill> : <Pill tone={i.result === 'PASS' ? 'green' : 'red'}>{i.result}</Pill>}</div>)}</div>
+        <div className="rv-card"><h2>Checklist items</h2><p style={{ fontSize: 12 }}>Applicable controls for this ticket type. Human judgement remains separate from automated findings.</p>
+          {c.items.map(i => <div className="rv-chk" key={i.id} title={i.evidence}><span className="tier">Tier {i.tier}</span><span className="lbl">{i.label}</span><ResultPill i={i} /></div>)}
+          <details style={{ marginTop: 10, fontSize: 12 }}><summary>View source evidence mapped to each control</summary>
+            {c.items.map(i => <p key={i.id} style={{ marginTop: 8 }}><b>{i.label}</b>: {i.evidence.replace(/\n/g, ' · ')}</p>)}</details></div>
         <div className="rv-card" style={{ borderColor: '#c7d2fe' }}><h2 style={{ color: '#4338ca' }}>Why was this flagged?</h2>
-          {ticket.assessment.findings.map(f => <div key={f} style={{ borderTop: '1px solid #f1f5f9', padding: '10px 0' }}>
+          {controlFindings.map(f => <div key={f.key} style={{ borderTop: '1px solid #f1f5f9', padding: '10px 0' }}>
+            <b style={{ fontSize: 13 }}>{f.title}</b>
+            <p style={{ margin: '4px 0 0', fontSize: 12 }}><b>Evidence:</b> {f.evidence}</p>
+            <p style={{ margin: '2px 0 0', fontSize: 12 }}><b>Criterion:</b> {f.criterion}</p>
+            <p style={{ margin: '2px 0 0', fontSize: 12 }}><b>Recommendation:</b> {f.recommendation}</p></div>)}
+          {behFindings.map(f => <div key={f} style={{ borderTop: '1px solid #f1f5f9', padding: '10px 0' }}>
             <b style={{ fontSize: 13 }}>{f}</b>
             <p style={{ margin: '4px 0 0', fontSize: 12 }}><b>Evidence:</b> {explain.evidence(ticket, f)}</p>
             <p style={{ margin: '2px 0 0', fontSize: 12 }}><b>Criterion:</b> {explain.criterion(f)}</p>
             <p style={{ margin: '2px 0 0', fontSize: 12 }}><b>Recommendation:</b> {explain.recommendation(f, ticket.assessment.recommendations)}</p></div>)}
-          {behFindings.length ? <p style={{ fontSize: 11, marginTop: 8 }}>The behavioural signal is a statistical indication for the auditor’s judgement — not an automatic rule violation and not proof of wrongdoing.</p> : null}
-          {otherFindings.length === 0 && behFindings.length === 0 ? <p>No material control exceptions found.</p> : null}
-          <p style={{ fontSize: 11, marginTop: 8 }}>Evidence Coverage Index: {ticket.assessment.assessmentConfidence}% — how many independent findings support this assessment, not a statistical prediction of correctness.</p></div>
+          {behFindings.length ? <p style={{ fontSize: 11, marginTop: 8 }}>A behavioural flag requires review of the activity history; it does not establish a control failure.</p> : null}
+          {controlFindings.length === 0 && behFindings.length === 0 ? <p>No material control exceptions found.</p> : null}
+          <p style={{ fontSize: 11, marginTop: 8 }}>Evidence Coverage Index: {c.coverage}% of applicable automated controls have validated evidence outcomes; Tier C is excluded and still needs human judgement. This is not a prediction of accuracy.</p></div>
         <div className="rv-card"><h2>Auditor decision</h2>
-          {done ? <p>Decision saved: <b>{auditorLabel(record)}</b>{record.rationale ? <> — “{record.rationale}”</> : null}. Further submissions are disabled.</p> :
+          {done ? <p>Decision v{record.version ?? 1} · Rule v{record.ruleVersion ?? 1}: <b>{record.finalFinding ?? auditorLabel(record)}</b>{record.rationale ? <> — “{record.rationale}”</> : null}. A QC return creates a new review version; prior records remain inspectable.</p> :
             canDecide ? <>
-              <textarea className="rv-ta" rows={3} placeholder="Rationale (required for override or escalation)…" value={rationale} onChange={e => setRationale(e.target.value)} />
-              {mode === 'override' ? <select className="rv-sel" value={reason} onChange={e => setReason(e.target.value)}><option value="">Select an override reason</option>{overrideReasons.map(r => <option key={r}>{r}</option>)}</select> : null}
+              <p><b>Tier C · Human assessment (required to conclude the review)</b></p>
+              <select aria-label="Tier C judgement" className="rv-sel" value={humanFinding} onChange={e => setHumanFinding(e.target.value as '' | 'Compliant' | 'Non-compliant')}>
+                <option value="">Select human judgement</option><option value="Compliant">Satisfactory based on reviewed evidence</option><option value="Non-compliant">Quality / effectiveness concern</option></select>
+              <textarea aria-label="Auditor rationale" className="rv-ta" rows={3} placeholder="Short rationale — no minimum length (e.g. Reviewed or ok)" value={rationale} onChange={e => setRationale(e.target.value)} />
+              {c.state === 'NOT_ASSESSED' ? <div className="rv-warn">Incomplete evidence: an automatic compliant confirmation is blocked. Escalate or record a justified override with an evidence reference.</div> : null}
+              {mode === 'override' ? <>
+                <select className="rv-sel" aria-label="Final override disposition" value={overrideFinding} onChange={e => setOverrideFinding(e.target.value as '' | 'Compliant' | 'Non-compliant')}><option value="">Select final disposition</option><option>Compliant</option><option>Non-compliant</option></select>
+                <select className="rv-sel" aria-label="Evidence reference" value={evidenceRef} onChange={e => setEvidenceRef(e.target.value)}><option value="">Select supporting source</option>{sources.map(x => <option key={x.id} value={x.id}>{x.label}</option>)}</select>
+                <label><input type="checkbox" aria-label="I reviewed the override evidence" checked={evidenceReviewed} onChange={e => setEvidenceReviewed(e.target.checked)} /> I reviewed this source to support my human judgement.</label>
+                <select className="rv-sel" aria-label="Auditor Override Reason" value={reason} onChange={e => setReason(e.target.value)}><option value="">Select an override reason</option>{overrideReasons.map(r => <option key={r}>{r}</option>)}</select></> : null}
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-                <button className="rv-btn pri" onClick={() => save({ ...base, status: 'Reviewed', kind: 'Confirmed' })}>Confirm AI result</button>
-                {mode === 'override' ? <button className="rv-btn" disabled={!reason || !rationale.trim()} onClick={() => save({ ...base, status: 'Escalated', kind: 'Overridden', overrideReason: reason, rationale: rationale.trim() })}>Save override</button> : <button className="rv-btn" onClick={() => setMode('override')}>Override</button>}
-                <button className="rv-btn ind" disabled={!rationale.trim()} onClick={() => save({ ...base, status: 'Escalated', rationale: rationale.trim() })}>Escalate to QC</button>
+                <button className="rv-btn pri" disabled={!canConfirm} onClick={() => save({ ...base, status: 'Reviewed', kind: 'Confirmed', finalFinding: confirmResult, humanFinding: humanFinding || undefined, rationale: rationale.trim() })}>Confirm AI result</button>
+                {mode === 'override' ? <button className="rv-btn" disabled={!canOverride} onClick={() => save({ ...base, status: 'Escalated', kind: 'Overridden', finalFinding: overrideFinding, humanFinding: humanFinding || undefined, evidenceRef, evidenceReviewed, overrideReason: reason, rationale: rationale.trim() })}>Save override</button> : <button className="rv-btn" onClick={() => setMode('override')}>Override</button>}
+                <button className="rv-btn ind" disabled={!hasRationale} onClick={() => save({ ...base, status: 'Escalated', finalFinding: 'Escalate', humanFinding: humanFinding || undefined, rationale: rationale.trim() })}>Escalate to QC</button>
               </div>
-              <p style={{ fontSize: 11, marginTop: 8 }}>Every decision is timestamped to the audit trail with the auditor’s name and rationale.</p></> :
+              <p style={{ fontSize: 11, marginTop: 8 }}>Complete the human assessment, or escalate when evidence is insufficient. Overrides require a reason and reviewed source.</p></> :
               <p>Read-only for your role. Only the Auditor records the first decision on a ticket.</p>}
           {trail.length ? <div style={{ marginTop: 10 }}><h3>Audit trail</h3>{trail.map((e, i) => <p key={i} style={{ fontSize: 12, margin: '3px 0' }}>{e.event} · {e.occurredAt}{e.decision ? ` · ${e.decision}` : ''}{e.rationale ? ` — ${e.rationale}` : ''}</p>)}</div> : null}
         </div>
@@ -234,12 +276,12 @@ export function QCQueue({ tickets, decisions, workflow, onBlind, onAct, open }: 
           <div className="rv-row" style={{ padding: 0, border: 0 }}><span className="rv-id">{t.raw.ticketId}</span>{x.step === 1 ? <Pill tone="amber">Step 1 · Blind</Pill> : x.step === 2 ? <Pill tone="ind">Step 2 · Compare</Pill> : <Pill tone="green">{x.st.replace('Final - ', '')}</Pill>}</div>
           <small style={{ color: '#64748b' }}>{t.raw.ticketType} · {t.raw.title}</small></button>; })}</div>
         {current && c && i ? <div className="rv-card">
-          <div className="rv-row" style={{ border: 0, padding: 0 }}><h2>{current.raw.ticketId} · {current.raw.title}</h2><button className="rv-link" onClick={() => open(current)}>View full ticket →</button></div>
+          <div className="rv-row" style={{ border: 0, padding: 0 }}><h2>{current.raw.ticketId} · {current.raw.title}</h2>{i.step !== 1 ? <button className="rv-link" onClick={() => open(current)}>View full ticket →</button> : null}</div>
           {i.step === 1 ? <>
             <p>Step 1 of 2 — only the checklist and source evidence are shown. No AI output and no Auditor decision yet.</p>
             <div className="rv-kv"><div><span>SLA</span><b>{current.raw.slaStatus}</b></div><div><span>Approval</span><b>{current.raw.approvalStatus}</b></div></div>
             <h3>Resolution notes</h3><p>“{current.raw.resolutionNotes}”</p>
-            <h3>Checklist items</h3>{c.items.map(x => <div className="rv-chk" key={x.label}><span className="tier">Tier {x.tier}</span><span className="lbl">{x.label}</span>{x.result === 'JUDGEMENT' ? <Pill tone="grey">Human judgement</Pill> : <Pill tone={x.result === 'PASS' ? 'green' : 'red'}>{x.result}</Pill>}</div>)}
+            <h3>Checklist items</h3>{c.items.map(x => <div className="rv-chk" key={x.label}><span className="tier">Tier {x.tier}</span><span className="lbl">{x.label}</span><ResultPill i={x} /></div>)}
             <div className="rv-radio">{(['Compliant', 'Non-compliant', 'Escalate'] as BlindView[]).map(v => <label key={v} className={choice === v ? 'on' : ''}><input type="radio" name="blind" checked={choice === v} onChange={() => setChoice(v)} /> {v}</label>)}</div>
             <button className="rv-btn pri" disabled={!choice} onClick={() => { if (choice) { onBlind(current.raw.ticketId, choice); setChoice(''); } }}>Submit &amp; reveal Auditor’s result</button></> :
           <>
@@ -334,16 +376,16 @@ export function GovernanceWorkspace({ tickets, decisions, workflow, onAct, open,
   const controlCount = (c: string) => cases.filter(x => primaryControl(x.t) === c).length;
   const endorsed = tickets.filter(t => workflow[t.raw.ticketId]?.qc?.outcome === 'Agreed').length;
   const sentBack = Object.values(workflow).reduce((n, r) => n + r.history.filter(h => h.startsWith('QC · Returned')).length, 0);
-  const confirmedNon = tickets.filter(t => workflow[t.raw.ticketId]?.gov?.outcome === 'Approved' && !checklistOf(t).pass).length;
+  const confirmedNon = tickets.filter(t => workflow[t.raw.ticketId]?.gov?.outcome === 'Approved' && checklistOf(t).fails.length > 0).length;
   const recurring = useMemo(() => [
-    { label: 'Missing approval evidence', n: tickets.filter(t => checklistOf(t).items[0].result === 'FAIL').length },
-    { label: 'SLA breach', n: tickets.filter(t => checklistOf(t).items[1].result === 'FAIL').length },
-    { label: 'Documentation incomplete', n: tickets.filter(t => checklistOf(t).items[2].result === 'FAIL').length },
+    { label: 'Missing approval evidence', n: tickets.filter(t => failsIn(t, 'approval')).length },
+    { label: 'SLA breach', n: tickets.filter(t => failsIn(t, 'SLA')).length },
+    { label: 'Documentation incomplete', n: tickets.filter(t => failsIn(t, 'docs')).length },
     { label: 'Behavioural signal', n: tickets.filter(t => behaviourOf(t).flagged).length }], [tickets]);
   const maxN = Math.max(1, ...recurring.map(r => r.n));
   const ledger = [
-    { name: 'Tier A · Approval evidence check', has: (t: TV) => checklistOf(t).items[0].result === 'FAIL' },
-    { name: 'Tier B · Documentation completeness', has: (t: TV) => checklistOf(t).items[2].result === 'FAIL' },
+    { name: 'Tier A · Approval evidence check', has: (t: TV) => failsIn(t, 'approval') },
+    { name: 'Tier B · Documentation completeness', has: (t: TV) => failsIn(t, 'docs') },
     { name: 'Behavioural · Anomaly signal', has: (t: TV) => behaviourOf(t).flagged }].map(l => {
     const flagged = decided.filter(l.has); const confirmed = flagged.filter(t => decisions[t.raw.ticketId].kind === 'Confirmed').length;
     return { ...l, tested: decided.length, trust: decided.length < 30 ? 'Insufficient Evidence' : flagged.length ? `${Math.round(100 * confirmed / flagged.length)}% auditor-confirmed` : 'No flags to assess' };
@@ -380,23 +422,16 @@ export function GovernanceWorkspace({ tickets, decisions, workflow, onAct, open,
 }
 
 /* ------------------------------ Management overview ------------------------------ */
-export function AssuranceOverview({ tickets, decisions, workflow, metricsLog, onAct, open }: { tickets: TV[]; decisions: Decisions; workflow: Workflow; metricsLog: MetricEvent[]; onAct: Act; open: (t: TV) => void }) {
+export function AssuranceOverview({ tickets, decisions, workflow, onAct, open }: { tickets: TV[]; decisions: Decisions; workflow: Workflow; metricsLog: MetricEvent[]; onAct: Act; open: (t: TV) => void }) {
   const [comments, setComments] = useState<Record<string, string>>({});
-  const n = tickets.length; const m = computeMetrics(metricsLog, tickets, decisions);
+  const n = tickets.length;
   const avg = n ? Math.round(tickets.reduce((s, t) => s + t.assessment.complianceScore, 0) / n) : 0;
   const hc = tickets.filter(isHighRisk).length; const sla = tickets.filter(t => /breach/i.test(t.raw.slaStatus)).length; const beh = tickets.filter(t => behaviourOf(t).flagged).length;
   const esc = tickets.filter(t => stageOf(decisions[t.raw.ticketId], workflow[t.raw.ticketId]) === 'Escalated to Management');
   const pct = (a: number, b: number) => b ? `${Math.round(100 * a / b)}%` : '—';
-  const qcDone = m.qcAgreed + m.qcReturned;
   return <div className="rv-page">
     <h1>Assurance Overview</h1><p className="rv-sub-t">Trend and business-value view. Same underlying data as the Auditor and Governance views — no separate data model. Figures cover the currently loaded batch only.</p>
     <div className="rv-grid4"><Stat label="Avg. compliance" value={n ? `${avg}%` : '—'} /><Stat label="High + critical risk" value={n ? hc : '—'} color="#b91c1c" /><Stat label="SLA breach rate" value={pct(sla, n)} color="#b45309" /><Stat label="Behavioural flags" value={n ? beh : '—'} color="#4338ca" /></div>
-    <div className="rv-card"><h2>Pilot scorecard — three stated criteria</h2><p>No pass thresholds have been agreed yet, so these show measured values, not pass/fail.</p>
-      <div className="rv-grid4" style={{ marginBottom: 0 }}>
-        <div><h3>Accuracy</h3><b style={{ fontSize: 22 }}>{pct(m.confirmed, m.decided)}</b><p>AI–auditor agreement on {m.decided} reviewed ticket(s). Agreement is a proxy: true accuracy needs the audit team’s own final results as the answer key.</p></div>
-        <div><h3>Quality of outcome</h3><b style={{ fontSize: 22 }}>{pct(m.qcAgreed, qcDone)}</b><p>Share of QC checks that endorsed the Auditor’s call ({qcDone} QC checks).</p></div>
-        <div><h3>Explainability</h3><b style={{ fontSize: 22 }}>Qualitative</b><p>Every finding shows its evidence, criterion and recommendation. To be judged by reviewers, not scored.</p></div>
-        <div><h3>Review time</h3><b style={{ fontSize: 22 }}>{fmtDuration(m.avgReviewMs)}</b><p>Average auditor time per ticket in this demo; not a production measurement.</p></div></div></div>
     <div className="rv-card"><h2>Escalated to Management</h2>{esc.length === 0 ? <p>No escalations awaiting a Management decision.</p> : esc.map(t => <div key={t.raw.ticketId} style={{ borderTop: '1px solid #f1f5f9', padding: '10px 0' }}>
       <div className="rv-row" style={{ border: 0, padding: 0 }}><button className="rv-link" onClick={() => open(t)}><span className="rv-id">{t.raw.ticketId}</span></button><Pill tone="ind">Escalated by Governance</Pill></div>
       <small style={{ color: '#64748b' }}>{workflow[t.raw.ticketId]?.gov?.comment}</small>
@@ -407,5 +442,3 @@ export function AssuranceOverview({ tickets, decisions, workflow, metricsLog, on
       {tickets.map(t => <div className="rv-row" key={t.raw.ticketId} style={{ padding: '6px 0' }}><span className="rv-id" style={{ minWidth: 90 }}>{t.raw.ticketId}</span><div className="rv-bar"><i style={{ width: `${t.assessment.complianceScore}%`, background: isHighRisk(t) ? '#b91c1c' : '#0f766e' }} /></div><b>{t.assessment.complianceScore}%</b></div>)}</div>
   </div>;
 }
-
-
